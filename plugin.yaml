@@ -1,5 +1,5 @@
 name: webhook-v1-bridge
-version: 0.1.0
+version: 0.2.0
 description: Serve the webhook platform's routes under the API server as /v1/webhooks/{route}.
 author: Wiz.Chen
 kind: standalone

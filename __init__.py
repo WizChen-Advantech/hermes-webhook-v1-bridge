@@ -10,14 +10,16 @@ the request, body and signature headers unchanged, to the webhook platform on
 and duplicates; on top of that the caller must send the API server's key
 (``Authorization: Bearer``) like every other ``/v1`` call.
 
-It adds a middleware by replacing ``cors_middleware`` in
-``gateway.platforms.api_server`` with one that handles the bridge path and
-otherwise calls the original. The gateway discovers plugins before it connects
-the platforms, so the API server is built with it. If a Hermes release renames
-what this relies on, the plugin logs one warning and changes nothing.
+It patches aiohttp's ``UrlDispatcher.resolve``: for the API server's router
+only (the one serving ``/v1/chat/completions``), a ``POST`` under the prefix
+resolves to the bridge handler; every other request resolves as before. The
+router is consulted on each request, so this also works when the plugin loads
+after the API server has started -- which some deployments do. If a Hermes
+release renames what this relies on, the plugin logs one warning and changes
+nothing.
 
-Target: ``WEBHOOK_BRIDGE_TARGET`` (default ``http://127.0.0.1:$WEBHOOK_PORT``,
-port 8644).
+Target: ``WEBHOOK_BRIDGE_TARGET``, else ``http://127.0.0.1:<port>`` with the
+port from ``WEBHOOK_PORT``, ``platforms.webhook.extra.port`` or 8644.
 """
 
 from __future__ import annotations
@@ -42,11 +44,23 @@ _PASS_HEADERS = (
 )
 
 
+def _config_port() -> str:
+    """platforms.webhook.extra.port from config.yaml, or ''."""
+    try:
+        from hermes_cli.config import load_config
+        port = load_config()["platforms"]["webhook"]["extra"]["port"]
+        return str(int(port))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _target() -> str:
     explicit = os.environ.get("WEBHOOK_BRIDGE_TARGET", "").strip()
     if explicit:
         return explicit.rstrip("/")
-    return f"http://127.0.0.1:{os.environ.get('WEBHOOK_PORT', '8644').strip() or '8644'}"
+    # The webhook platform reads WEBHOOK_PORT over config.yaml, so do we.
+    port = os.environ.get("WEBHOOK_PORT", "").strip() or _config_port() or "8644"
+    return f"http://127.0.0.1:{port}"
 
 
 def _route_name(path: str) -> str | None:
@@ -86,31 +100,55 @@ async def _forward(request, web, aiohttp):
         )
 
 
+def _serves_api(router) -> bool:
+    """Whether this router is the API server's: it has /v1/chat/completions."""
+    try:
+        return any(
+            getattr(resource, "canonical", None) == "/v1/chat/completions"
+            for resource in router.resources()
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def apply() -> bool:
     """Patch the API server. True when the bridge is in place."""
     try:
         import aiohttp
         from aiohttp import web
+        from aiohttp.web_urldispatcher import UrlDispatcher
         from gateway.platforms import api_server
     except Exception as exc:  # noqa: BLE001
         logger.warning("webhook-v1-bridge: cannot import the API server (%s); not applied", exc)
         return False
-    original = getattr(api_server, "cors_middleware", None)
-    if original is None or not hasattr(api_server.APIServerAdapter, "_check_auth"):
-        logger.warning("webhook-v1-bridge: this Hermes has no api_server.cors_middleware "
-                       "or APIServerAdapter._check_auth; not applied")
+    if not hasattr(api_server.APIServerAdapter, "_check_auth") or not hasattr(UrlDispatcher, "resolve"):
+        logger.warning("webhook-v1-bridge: this Hermes has no APIServerAdapter._check_auth "
+                       "or aiohttp UrlDispatcher.resolve; not applied")
         return False
+    original = UrlDispatcher.resolve
     if getattr(original, _MARK, False):
         return True
 
-    @web.middleware
-    async def bridge_middleware(request, handler):
-        if request.method == "POST" and request.path.startswith(PREFIX):
-            return await _forward(request, web, aiohttp)
-        return await original(request, handler)
+    async def handle(request):
+        return await _forward(request, web, aiohttp)
 
-    setattr(bridge_middleware, _MARK, True)
-    api_server.cors_middleware = bridge_middleware
+    # A router of its own, never attached to an app, only to build match info
+    # for the bridge path the same way any route gets it.
+    bridge = UrlDispatcher()
+    bridge.add_route("POST", PREFIX + "{route:.*}", handle)
+    api_routers: dict[int, bool] = {}
+
+    async def resolve(self, request):
+        if request.method == "POST" and request.path.startswith(PREFIX):
+            serves_api = api_routers.get(id(self))
+            if serves_api is None:
+                serves_api = api_routers[id(self)] = _serves_api(self)
+            if serves_api:
+                return await original(bridge, request)
+        return await original(self, request)
+
+    setattr(resolve, _MARK, True)
+    UrlDispatcher.resolve = resolve
     logger.info("webhook-v1-bridge: POST %s{route} -> %s/webhooks/{route}", PREFIX, _target())
     return True
 

@@ -24,14 +24,17 @@ deliveries; on top of that the caller must send the API server key
 | same `X-Request-ID` again | 200 `duplicate` |
 | `/v1/webhooks/a/b` | 404 |
 
-Other API server paths (`/v1/models`, `/v1/chat/completions`, ...) are unchanged.
+Other API server paths (`/v1/models`, `/v1/chat/completions`, ...) are unchanged, and
+so are other aiohttp servers in the process. The bridge works whether the plugin loads
+before or after the API server starts (`tests/test_bridge.py`, `late`).
 
 ## Install
 
 1. Enable the webhook platform with at least one route in `config.yaml`
-   (`platforms.webhook.extra.routes`), and set `WEBHOOK_ENABLED=true` and
-   `WEBHOOK_SECRET` in `.env` (the secret from the environment is only read when
-   `WEBHOOK_ENABLED` is set).
+   (`platforms.webhook.enabled: true`, `platforms.webhook.extra.routes`). Give each
+   route a `secret`, or set `WEBHOOK_ENABLED=true` and `WEBHOOK_SECRET` in `.env` (the
+   secret from the environment is only read when `WEBHOOK_ENABLED` is set).
+   Plugins load only when listed in `plugins.enabled` in `config.yaml`.
 2. Dashboard: **Plugins → Install** with `WizChen-Advantech/hermes-webhook-v1-bridge`,
    enable it, then restart the gateway. Or on the host:
 
@@ -42,8 +45,8 @@ Other API server paths (`/v1/models`, `/v1/chat/completions`, ...) are unchanged
 
 The gateway log then shows
 `webhook-v1-bridge: POST /v1/webhooks/{route} -> http://127.0.0.1:8644/webhooks/{route}`.
-If the webhook platform runs elsewhere, set `WEBHOOK_BRIDGE_TARGET`
-(default `http://127.0.0.1:$WEBHOOK_PORT`, port 8644).
+The port comes from `WEBHOOK_PORT`, else `platforms.webhook.extra.port`, else 8644;
+`WEBHOOK_BRIDGE_TARGET` overrides the whole address.
 
 ## Call
 
@@ -62,8 +65,16 @@ curl -X POST "https://<host>/v1/webhooks/<route>" \
 
 - The bridge only forwards `POST` to one route name; nested paths get 404.
 - Only signature, event and delivery headers are passed on; `Authorization` is not.
-- If a Hermes release no longer has `gateway.platforms.api_server.cors_middleware` or
-  `APIServerAdapter._check_auth`, the plugin logs one warning and changes nothing.
+- Only the API server's router (the one serving `/v1/chat/completions`) is bridged.
+- If a Hermes release no longer has `APIServerAdapter._check_auth`, or aiohttp no longer
+  has `UrlDispatcher.resolve`, the plugin logs one warning and changes nothing.
+
+## Tests
+
+```bash
+PYTHONPATH=<hermes source> python tests/test_bridge.py        # applied before start
+PYTHONPATH=<hermes source> python tests/test_bridge.py late   # applied after start
+```
 
 To undo, disable the plugin and restart the gateway.
 
